@@ -1,0 +1,142 @@
+diff --git a/LibCmo/LibCmo/CK2/CKFileReader.cpp b/LibCmo/LibCmo/CK2/CKFileReader.cpp
+index d2aadfd..3e28508 100644
+--- a/LibCmo/LibCmo/CK2/CKFileReader.cpp
++++ b/LibCmo/LibCmo/CK2/CKFileReader.cpp
+@@ -125,10 +125,11 @@ namespace LibCmo::CK2 {
+ 				gotten_crc = CKComputeDataCRC(parser->GetPtr(), this->m_FileInfo.DataPackSize, 0u);
+ 
+ 				// Both CRC compute methods are failed. This file may be really broken.
+-				// Report exception directly.
++				// virtools-script-dump: some Virtools files ship a tampered/zeroed
++				// header CRC. The packed body itself is intact, so downgrade this from a
++				// hard failure to a warning and continue loading so we can dump scripts.
+ 				if (gotten_crc != this->m_FileInfo.Crc) {
+-					this->m_Ctx->OutputToConsole(u8"Virtools file CRC error.");
+-					return CKERROR::CKERR_FILECRCERROR;
++					this->m_Ctx->OutputToConsole(u8"Virtools file CRC error (ignored: virtools-script-dump CRC-bypass build).");
+ 				}
+ 			}
+ 
+@@ -255,8 +256,7 @@ namespace LibCmo::CK2 {
+ 				0u
+ 			);
+ 			if (gotten_crc != this->m_FileInfo.Crc) {
+-				this->m_Ctx->OutputToConsole(u8"Virtools file CRC error.");
+-				return CKERROR::CKERR_FILECRCERROR;
++				this->m_Ctx->OutputToConsole(u8"Virtools file CRC error (ignored: virtools-script-dump CRC-bypass build).");
+ 			}
+ 
+ 			// MARK: why read again? especially for file ver == 7.
+diff --git a/LibCmo/LibCmo/CK2/CKStateChunk.hpp b/LibCmo/LibCmo/CK2/CKStateChunk.hpp
+index d952050..2b86234 100644
+--- a/LibCmo/LibCmo/CK2/CKStateChunk.hpp
++++ b/LibCmo/LibCmo/CK2/CKStateChunk.hpp
+@@ -171,6 +171,12 @@ namespace LibCmo::CK2 {
+ 		 * @return The data buffer's size in CKBYTE.
+ 		*/
+ 		CKDWORD GetDataSize() const;
++		/**
++		 * @brief virtools-script-dump: expose the parsed object-reference list (referenced
++		 * object IDs) so tooling can reconstruct the behavior graph without
++		 * decoding each behavior's packed NEWDATA blob.
++		*/
++		const XContainer::XArray<CKDWORD>& GetObjectList() const { return m_ObjectList; }
+ 		/**
+ 		 * @brief Get data version in this CKStateChunk.
+ 		 * @remark Data version is frequently used by calling of CKStateChunk to distinguish different data layout due to compatibility reason.
+diff --git a/Unvirt/UnvirtContext.cpp b/Unvirt/UnvirtContext.cpp
+index 75d76e7..cbd37c2 100644
+--- a/Unvirt/UnvirtContext.cpp
++++ b/Unvirt/UnvirtContext.cpp
+@@ -512,6 +512,91 @@ namespace Unvirt::Context {
+ 	}
+ 
+ 	void UnvirtContext::HandleTest(const CmdHelper::TestParam& param) {
++		// ===== virtools-script-dump generic chunk dump =====
++		// Emit, for every file object, a machine-readable line:
++		//   G\t<index>\t<ObjectId>\t<ClassId int>\t<name>[\tI<idHex>=<dword,dword,...>]*
++		// i.e. the base object info followed by one I<id>=... token per identifier
++		// in the object's CKStateChunk (with that identifier's data area dumped as
++		// raw little-endian DWORDs in hex). This is a complete, format-agnostic dump
++		// that cmo_script_dump.py decodes offline into the behavior graph AND the
++		// parameter values (NEWDATA=I20, IO flags=I8, param value=I40, source=I1000).
++		// Only graph-relevant classes are dumped in full to keep output small and
++		// avoid huge mesh/texture binary blobs.
++		{
++			if (!HasOpenedFile()) {
++				PrintError(u8"No loaded file.");
++				return;
++			}
++			using CID = LibCmo::CK2::CK_CLASSID;
++			auto wants_idents = [](CID c) {
++				switch (c) {
++				case CID::CKCID_PARAMETERIN:
++				case CID::CKCID_PARAMETEROUT:
++				case CID::CKCID_PARAMETERLOCAL:
++				case CID::CKCID_PARAMETEROPERATION:
++				case CID::CKCID_BEHAVIORLINK:
++				case CID::CKCID_BEHAVIOR:
++				case CID::CKCID_BEHAVIORIO:
++					return true;
++				default:
++					return false;
++				}
++			};
++			const auto& objs = m_FileReader->GetFileObjects();
++			size_t idx = 0;
++			for (const auto& cobj : objs) {
++				std::cout << "G\t" << idx
++				          << '\t' << static_cast<uint64_t>(cobj.ObjectId)
++				          << '\t' << static_cast<uint32_t>(cobj.ObjectCid)
++				          << '\t' << reinterpret_cast<const char*>(cobj.Name.c_str());
++				if (cobj.Data != nullptr && wants_idents(cobj.ObjectCid)) {
++					LibCmo::CK2::CKStateChunk* ck = cobj.Data;
++					ck->StartRead();
++					auto profile = ck->GetIdentifiersProfile();
++					ck->StopRead();
++					for (const auto& ent : profile) {
++						std::cout << "\tI" << std::hex << ent.m_Identifier << "=";
++						ck->StartRead();
++						LibCmo::CKDWORD sz = 0;
++						if (ck->SeekIdentifierDwordAndReturnSize(ent.m_Identifier, &sz)) {
++							// cap absurd sizes (binary blobs) at 4096 bytes
++							LibCmo::CKDWORD n = (sz > 4096u ? 4096u : sz) / 4u;
++							for (LibCmo::CKDWORD i = 0; i < n; ++i) {
++								LibCmo::CKDWORD d = 0;
++								if (!ck->ReadStruct(d)) break;
++								if (i) std::cout << ',';
++								std::cout << d;
++							}
++						}
++						std::cout << std::dec;
++						ck->StopRead();
++					}
++				}
++				std::cout << '\n';
++				++idx;
++			}
++			// Manager data: dump each manager's GUID + its chunk's raw DWORDs so we
++			// can decode the Message / Attribute name tables (M\t<g1>\t<g2>\t<dwords>).
++			for (const auto& mgr : m_FileReader->GetManagersData()) {
++				std::cout << "M\t" << std::hex << mgr.Manager.d1 << '\t' << mgr.Manager.d2
++				          << std::dec << '\t';
++				if (mgr.Data != nullptr) {
++					mgr.Data->StartRead();
++					LibCmo::CKDWORD total = mgr.Data->GetDataSize();
++					LibCmo::CKDWORD n = (total > 4194304u ? 4194304u : total) / 4u;
++					for (LibCmo::CKDWORD i = 0; i < n; ++i) {
++						LibCmo::CKDWORD d = 0;
++						if (!mgr.Data->ReadStruct(d)) break;
++						if (i) std::cout << ',';
++						std::cout << std::hex << d << std::dec;
++					}
++					mgr.Data->StopRead();
++				}
++				std::cout << '\n';
++			}
++			std::cout.flush();
++			return;
++		}
+ #if defined(LIBCMO_BUILD_DEBUG)
+ 		// MARK: Add the debug code here.
+ 
