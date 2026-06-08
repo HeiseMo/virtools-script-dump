@@ -28,6 +28,7 @@ Usage
   cmo_script_dump.py json [index|name]         # one script (or all) as JSON, for diff/tooling
   cmo_script_dump.py dataflow <param|#index>   # trace backward what produces a parameter's value
   cmo_script_dump.py blocks [--dll strings.txt] # leaf building-block types + proto GUID (C++ blocks)
+  cmo_script_dump.py array [name|#index]        # decode a CKDataArray data table (columns + rows)
   cmo_script_dump.py messages                  # the Message Manager name table (index->name)
   cmo_script_dump.py attributes [filter]       # Attribute Manager strings (name reference)
 
@@ -529,6 +530,63 @@ class GraphModel:
         """Graph behaviors (have children) that are not nested in another graph."""
         return sorted(g for g in self.children if g not in self.parent)
 
+    def data_arrays(self):
+        """[(idx, name)] of CKDataArray objects (cid 52) — the scene's data tables."""
+        return sorted((i, r["name"]) for i, r in self.rows.items() if r["cid"] == 52)
+
+    def decode_data_array(self, idx):
+        """Decode a CKDataArray into {columns:[(name,type)], rows:[[cells]]}.
+        FORMAT (id 0x1000): [ncol] then per col [namelen][name][type][+guid if 5].
+        DATA   (id 0x2000): [nrow] then row-major typed cells.
+        Cell types: 1=int, 2=float, 3=string, 5=parameter(float)."""
+        import struct
+        r = self.rows.get(idx)
+        if not r:
+            return None
+        ids = r["ids"]
+
+        def blob(key):
+            return b"".join(d.to_bytes(4, "little") for d in ids.get(key, []))
+
+        fmt = blob(0x1000)
+        cols, off = [], 0
+        if len(fmt) >= 4:
+            ncol = int.from_bytes(fmt[0:4], "little"); off = 4
+            while off + 4 <= len(fmt) and len(cols) < ncol:
+                L = int.from_bytes(fmt[off:off + 4], "little"); off += 4
+                if not (1 <= L <= 64) or off + L > len(fmt):
+                    break
+                name = fmt[off:off + L].split(b"\x00", 1)[0].decode("latin-1")
+                off += ((L + 3) // 4) * 4
+                typ = int.from_bytes(fmt[off:off + 4], "little"); off += 4
+                if typ == 5:                       # parameter column: skip its GUID
+                    off += 8
+                cols.append((name, typ))
+        dat = blob(0x2000)
+        rows, off = [], 0
+        if cols and len(dat) >= 4:
+            nrow = int.from_bytes(dat[0:4], "little"); off = 4
+
+            def cell(t):
+                nonlocal off
+                if off + 4 > len(dat):
+                    return None
+                if t == 3:                         # string cell
+                    L = int.from_bytes(dat[off:off + 4], "little"); off += 4
+                    s = dat[off:off + L].split(b"\x00", 1)[0]
+                    off += ((L + 3) // 4) * 4
+                    return s.decode("latin-1")
+                v = int.from_bytes(dat[off:off + 4], "little"); off += 4
+                if t in (2, 5):                    # float
+                    f = struct.unpack("<f", v.to_bytes(4, "little"))[0]
+                    return int(f) if f == int(f) and abs(f) < 1e9 else round(f, 4)
+                return v                            # int
+            for _ in range(min(nrow, 100000)):
+                if off >= len(dat):
+                    break
+                rows.append([cell(t) for _, t in cols])
+        return {"columns": cols, "rows": rows}
+
     def leaf_block_guid(self, idx):
         """Prototype GUID of a leaf building block (None for graph behaviors).
         A leaf's NEWDATA is [flags, guid_lo, guid_hi, ...]; graphs carry no GUID.
@@ -736,6 +794,36 @@ def _script_dict(g, root, seen=None):
     return {"index": root, "name": g.name(root), "nodes": nodes, "links": links}
 
 
+def cmd_array(args):
+    """List the scene's data tables, or dump one (by name or #index) as a table."""
+    g = load_graph(args)
+    if not args.key:
+        for i, name in g.data_arrays():
+            d = g.decode_data_array(i)
+            cols = ", ".join(c for c, _ in d["columns"]) if d else ""
+            print(f"#{i:<7} {len(d['rows']) if d else 0:4d} rows  {name}"
+                  f"   [{cols}]")
+        sys.stderr.write(f"\n{len(g.data_arrays())} data arrays\n")
+        return
+    key = args.key
+    hits = ([int(key)] if key.isdigit() and int(key) in g.rows
+            else [i for i, n in g.data_arrays() if key.lower() == n.lower()]
+            or [i for i, n in g.data_arrays() if key.lower() in n.lower()])
+    if not hits:
+        sys.exit(f"No data array matching {args.key!r}")
+    d = g.decode_data_array(hits[0])
+    if not d or not d["columns"]:
+        sys.exit("Could not decode that data array.")
+    name = g.name(hits[0])
+    hdr = [c for c, _ in d["columns"]]
+    print(f"=== {name}  (#{hits[0]}, {len(d['rows'])} rows) ===")
+    print("\t".join(hdr))
+    for row in d["rows"][:args.rows]:
+        print("\t".join("" if v is None else str(v) for v in row))
+    if len(d["rows"]) > args.rows:
+        sys.stderr.write(f"\n…{len(d['rows']) - args.rows} more rows (raise --rows)\n")
+
+
 def cmd_blocks(args):
     """List distinct leaf building-block types with their prototype GUID + usage
     count — the blocks whose implementation is C++ (Virtools' DLLs for standard
@@ -881,6 +969,9 @@ def main():
     sp.add_argument("--dll", help="strings file of the game DLL; flags blocks "
                                   "implemented there with [DLL]")
     sp.set_defaults(func=cmd_blocks)
+    sp = sub.add_parser("array"); sp.add_argument("key", nargs="?")
+    sp.add_argument("--rows", type=int, default=200)
+    sp.set_defaults(func=cmd_array)
     sub.add_parser("messages").set_defaults(func=cmd_messages)
     sp = sub.add_parser("attributes"); sp.add_argument("filter", nargs="?")
     sp.set_defaults(func=cmd_attributes)
