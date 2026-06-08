@@ -64,28 +64,35 @@ owning behaviour and **13114/13117** link endpoints resolve.
 > from one Virtools 4.0 title. They cover the standard Virtools types, but exotic
 > custom parameter types may show as raw hex. PRs with more GUIDs welcome.
 
-## Setup
+## Setup (Linux)
 
-1. **Build the patched Unvirt** (needs CMake ≥ 3.23 and a C++23 compiler; see
-   LibCmo's own COMPILE.md for its `YYCCommonplace`/`stb`/`zlib` prerequisites):
+You need the patched `Unvirt` binary, Python 3.10+, and `script(1)` (util-linux);
+`graphviz` only if you want to render the `dot` output.
 
-   ```bash
-   git clone https://github.com/yyc12345/libcmo21
-   cd libcmo21
-   git apply /path/to/libcmo-virtools-script-dump.patch
-   # ...configure & build per libcmo21/COMPILE.md...
-   # the Unvirt executable ends up in your build dir
-   ```
+### Option A — download the prebuilt Unvirt (recommended)
 
-2. **Point the tool at it** (and at your file):
+A patched `Unvirt` is built by CI and published here:
+**https://github.com/HeiseMo/libcmo21/releases/tag/unvirt-linux**
 
-   ```bash
-   export UNVIRT=/path/to/build/Unvirt/Unvirt
-   export CMO_FILE=/path/to/your.cmo        # or pass --cmo each time
-   ```
+```bash
+curl -L -o unvirt.tgz \
+  https://github.com/HeiseMo/libcmo21/releases/download/unvirt-linux/unvirt-linux-x64.tar.gz
+tar xzf unvirt.tgz
+export UNVIRT="$PWD/unvirt-linux-x64/run-unvirt.sh"   # wrapper finds bundled libs
+export CMO_FILE=/path/to/your.cmo                     # or pass --cmo each time
+```
 
-Requires Python 3.10+, `script(1)` (util-linux), and `graphviz` only if you want
-to render the `dot` output.
+### Option B — build it yourself
+
+The patched source lives in the fork **https://github.com/HeiseMo/libcmo21**
+(LibCmo `v0.4.0` + the included `libcmo-virtools-script-dump.patch`). Needs
+CMake ≥ 3.23 and a C++23 compiler; the exact dependency pins and build steps are
+in `.github/workflows/unvirt-release.yml` there (YYCCommonplace v2.0.0, zlib
+v1.3.1, stb). Then:
+
+```bash
+export UNVIRT=/path/to/your/build/Unvirt
+```
 
 ## Usage
 
