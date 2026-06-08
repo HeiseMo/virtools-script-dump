@@ -26,6 +26,7 @@ Usage
   cmo_script_dump.py script <index|name>       # render one script: sub-behaviors + exec links
   cmo_script_dump.py dot <index|name>          # emit Graphviz .dot for one script
   cmo_script_dump.py json [index|name]         # one script (or all) as JSON, for diff/tooling
+  cmo_script_dump.py dataflow <param|#index>   # trace backward what produces a parameter's value
   cmo_script_dump.py messages                  # the Message Manager name table (index->name)
   cmo_script_dump.py attributes [filter]       # Attribute Manager strings (name reference)
 
@@ -527,6 +528,70 @@ class GraphModel:
         """Graph behaviors (have children) that are not nested in another graph."""
         return sorted(g for g in self.children if g not in self.parent)
 
+    # -- parameter data-flow -------------------------------------------------
+    def _dataflow_index(self):
+        """Build reverse indices for tracing how a parameter value is produced:
+          pin_src[pin]   -> source param it reads from (PIN data link, id 0x1000)
+          pout_op[pout]  -> Parameter Operation producing it; op_in[op] -> inputs
+          pout_beh[pout] -> behaviour producing it (computed by the BB's C++)
+        """
+        if hasattr(self, "_df"):
+            return self._df
+        pin_src, pout_op, op_in, pout_beh = {}, {}, {}, {}
+        for idx, r in self.rows.items():
+            if r["cid"] == 2:                              # PIN
+                s = r["ids"].get(0x1000)
+                if s:
+                    pin_src[idx] = s[-1]
+            elif r["cid"] == 4:                            # Parameter Operation
+                d = r["ids"].get(0x400)
+                if d and len(d) >= 4:
+                    refs = d[3:3 + d[2]]
+                    if len(refs) >= 1:
+                        op_in[idx] = refs[:-1]
+                        pout_op[refs[-1]] = idx
+        for beh, prm in self.beh_params.items():
+            for p in prm.get("POUT", []):
+                pout_beh[p] = beh
+        self._df = {"pin_src": pin_src, "pout_op": pout_op,
+                    "op_in": op_in, "pout_beh": pout_beh}
+        return self._df
+
+    def trace_param(self, idx, depth=0, seen=None, maxdepth=14):
+        """Backward data-flow tree: what produces this parameter's value, down to
+        leaves (literals, attribute refs, or a BB output we can't see past)."""
+        df = self._dataflow_index()
+        seen = seen or set()
+        r = self.rows.get(idx)
+        if not r:
+            return [f"{'  ' * depth}?{idx}"]
+        cid, nm = r["cid"], r["name"]
+        val = self.param_value(idx)
+        shown = f" = {val}" if (val and not val.startswith("<-")) else ""
+        line = f"{'  ' * depth}{nm}{shown}  [{CID.get(cid, cid)} #{idx}]"
+        if idx in seen or depth >= maxdepth:
+            return [line + ("  (cycle)" if idx in seen else "  (…)")]
+        seen = seen | {idx}
+        out = [line]
+        if cid == 2:                                       # PIN -> its source
+            s = df["pin_src"].get(idx)
+            if s is not None and s in self.rows:
+                out += self.trace_param(s, depth + 1, seen, maxdepth)
+        elif cid == 3:                                     # POUT -> producer
+            if idx in df["pout_op"]:
+                op = df["pout_op"][idx]
+                out.append(f"{'  ' * (depth + 1)}└ op: {self.name(op)}")
+                for inp in df["op_in"].get(op, []):
+                    out += self.trace_param(inp, depth + 2, seen, maxdepth)
+            elif idx in df["pout_beh"]:
+                beh = df["pout_beh"][idx]
+                ins = self.beh_params.get(beh, {}).get("PIN", [])
+                out.append(f"{'  ' * (depth + 1)}└ computed by BB '{self.name(beh)}'"
+                           f" (#{beh}) from {len(ins)} input(s):")
+                for p in ins:
+                    out += self.trace_param(p, depth + 2, seen, maxdepth)
+        return out
+
 
 def load_graph(args):
     rows = {}
@@ -651,6 +716,30 @@ def _script_dict(g, root, seen=None):
     return {"index": root, "name": g.name(root), "nodes": nodes, "links": links}
 
 
+def cmd_dataflow(args):
+    """Trace backward what produces a parameter's value (by name or #index)."""
+    g = load_graph(args)
+    key = args.key
+    if key.isdigit() and int(key) in g.rows:
+        targets = [int(key)]
+    else:
+        k = key.lower()
+        targets = [i for i, r in g.rows.items()
+                   if r["cid"] in (3, 45) and r["name"].lower() == k]
+        if not targets:
+            targets = [i for i, r in g.rows.items()
+                       if r["cid"] in (3, 45, 2) and k in r["name"].lower()]
+    if not targets:
+        sys.exit(f"No parameter matching {args.key!r}")
+    for i, t in enumerate(targets[:args.limit]):
+        if i:
+            print()
+        print("\n".join(g.trace_param(t)))
+    if len(targets) > args.limit:
+        sys.stderr.write(f"\n…{len(targets) - args.limit} more matches "
+                         f"(raise --limit or use #index)\n")
+
+
 def cmd_json(args):
     import json
     g = load_graph(args)
@@ -731,6 +820,9 @@ def main():
     sp = sub.add_parser("dot"); sp.add_argument("key"); sp.set_defaults(func=cmd_dot)
     sp = sub.add_parser("json"); sp.add_argument("key", nargs="?")
     sp.set_defaults(func=cmd_json)
+    sp = sub.add_parser("dataflow"); sp.add_argument("key")
+    sp.add_argument("--limit", type=int, default=6)
+    sp.set_defaults(func=cmd_dataflow)
     sub.add_parser("messages").set_defaults(func=cmd_messages)
     sp = sub.add_parser("attributes"); sp.add_argument("filter", nargs="?")
     sp.set_defaults(func=cmd_attributes)
