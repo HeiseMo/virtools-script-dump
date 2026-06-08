@@ -25,6 +25,7 @@ Usage
   cmo_script_dump.py scripts                   # list all behavior-graph "scripts"
   cmo_script_dump.py script <index|name>       # render one script: sub-behaviors + exec links
   cmo_script_dump.py dot <index|name>          # emit Graphviz .dot for one script
+  cmo_script_dump.py json [index|name]         # one script (or all) as JSON, for diff/tooling
   cmo_script_dump.py messages                  # the Message Manager name table (index->name)
   cmo_script_dump.py attributes [filter]       # Attribute Manager strings (name reference)
 
@@ -66,6 +67,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -110,21 +112,36 @@ def run_unvirt(unvirt: str, cmo: str, commands: list[str], items: int = 0) -> st
                  f"with --unvirt or the $UNVIRT env var.")
     if not cmo:
         sys.exit("No input file. Pass --cmo <file.cmo> or set $CMO_FILE.")
+    cmo = os.path.abspath(cmo)
     if not os.path.exists(cmo):
         sys.exit(f"Input file not found: {cmo}")
-    script_lines = ["encoding Windows-1252"]
-    if items:
-        script_lines.append(f"items {items}")
-    script_lines.append(f"load deep {cmo}")
-    script_lines.extend(commands)
-    script_lines.append("exit")
-    stdin = "\n".join(script_lines) + "\n"
-    # `script -q -c CMD /dev/null` gives Unvirt a tty so its line editor behaves.
-    proc = subprocess.run(
-        ["script", "-q", "-c", exe, "/dev/null"],
-        input=stdin, text=True, capture_output=True,
-    )
-    return ANSI_RE.sub("", proc.stdout)
+    # Unvirt's `load` command splits its argument on spaces and has no quoting,
+    # so a path containing spaces (very common: "Program Files", "My Game") fails.
+    # Work around it by loading through a space-free symlink in a temp dir.
+    tmp = None
+    load_path = cmo
+    if " " in cmo:
+        tmp = tempfile.mkdtemp(prefix="vsd_")
+        load_path = os.path.join(tmp, os.path.basename(cmo).replace(" ", "_"))
+        os.symlink(cmo, load_path)
+    try:
+        script_lines = ["encoding Windows-1252"]
+        if items:
+            script_lines.append(f"items {items}")
+        script_lines.append(f"load deep {load_path}")
+        script_lines.extend(commands)
+        script_lines.append("exit")
+        stdin = "\n".join(script_lines) + "\n"
+        # `script -q -c CMD /dev/null` gives Unvirt a tty so its editor behaves.
+        proc = subprocess.run(
+            ["script", "-q", "-c", exe, "/dev/null"],
+            input=stdin, text=True, capture_output=True,
+        )
+        return ANSI_RE.sub("", proc.stdout)
+    finally:
+        if tmp:
+            import shutil as _sh
+            _sh.rmtree(tmp, ignore_errors=True)
 
 
 def load_table(args) -> list[dict]:
@@ -150,8 +167,10 @@ def load_table(args) -> list[dict]:
             "name": m.group(12),
         })
     if not rows:
-        sys.stderr.write("WARNING: parsed 0 rows. Unvirt output head:\n")
+        # Don't cache a failed/empty parse — surface the error instead of poisoning.
+        sys.stderr.write("Could not parse any objects. Unvirt output head:\n")
         sys.stderr.write("\n".join(out.splitlines()[:15]) + "\n")
+        return rows
     cols = ["index", "ckid", "classid", "has_obj", "has_chunk", "name"]
     with open(args.cache, "w", encoding="utf-8") as fh:
         fh.write("\t".join(cols) + "\n")
@@ -516,10 +535,15 @@ def load_graph(args):
         src = open(args.graphcache, encoding="utf-8", errors="replace")
     else:
         out = run_unvirt(args.unvirt, args.cmo, ["test"], items=400000)
+        kept = [ln for ln in out.splitlines()
+                if ln.startswith("G\t") or ln.startswith("M\t")]
+        if not kept:
+            # Don't cache a failed load — surface it instead of poisoning the cache.
+            sys.stderr.write("Could not read any objects. Unvirt output head:\n")
+            sys.stderr.write("\n".join(out.splitlines()[:15]) + "\n")
+            return GraphModel({}, {})
         with open(args.graphcache, "w", encoding="utf-8", errors="replace") as fh:
-            for line in out.splitlines():
-                if line.startswith("G\t") or line.startswith("M\t"):
-                    fh.write(line + "\n")
+            fh.write("\n".join(kept) + "\n")
         src = open(args.graphcache, encoding="utf-8", errors="replace")
     with src as fh:
         for line in fh:
@@ -589,6 +613,59 @@ def cmd_script(args):
     _render_script(g, root)
 
 
+def _script_dict(g, root, seen=None):
+    """Serialize a script graph to a plain dict: nodes (with decoded params),
+    nested sub-graphs, and internal execution links. Stable/ordered so two
+    versions of a file can be diffed."""
+    seen = seen if seen is not None else set()
+    seen.add(root)
+    kids = g.children.get(root, [])
+    chset = set(kids)
+    nodes = []
+    for c in kids:
+        prm = g.beh_params.get(c, {})
+        params = {}
+        for role, key in (("PIN", "in"), ("POUT", "out"), ("PLOC", "local")):
+            if prm.get(role):
+                params[key] = [{"name": g.name(p), "value": g.param_value(p)}
+                               for p in prm[role]]
+        node = {
+            "index": c,
+            "name": g.name(c),
+            "kind": "graph" if c in g.children else "bb",
+            "inputs": [g.name(io) for io in g.beh_inputs.get(c, [])],
+            "outputs": [g.name(io) for io in g.beh_outputs.get(c, [])],
+            "params": params,
+        }
+        if c in g.children and c not in seen:
+            sub = _script_dict(g, c, seen)
+            node["children"] = sub["nodes"]
+            node["links"] = sub["links"]
+        nodes.append(node)
+    links = []
+    for a, b in g.links:
+        oa, ob = g.io_owner.get(a), g.io_owner.get(b)
+        if oa in chset and ob in chset:
+            links.append({"from": {"behavior": g.name(oa), "io": g.name(a)},
+                          "to": {"behavior": g.name(ob), "io": g.name(b)}})
+    return {"index": root, "name": g.name(root), "nodes": nodes, "links": links}
+
+
+def cmd_json(args):
+    import json
+    g = load_graph(args)
+    if args.key:
+        root = g.resolve(args.key)
+        if root is None:
+            sys.exit(f"No behavior matching {args.key!r}")
+        out = _script_dict(g, root)
+    else:
+        out = {"file": os.path.basename(args.cmo or ""),
+               "scripts": [_script_dict(g, r) for r in g.script_roots()]}
+    json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
+    print()
+
+
 def cmd_dot(args):
     g = load_graph(args)
     root = g.resolve(args.key)
@@ -652,6 +729,8 @@ def main():
     sub.add_parser("scripts").set_defaults(func=cmd_scripts)
     sp = sub.add_parser("script"); sp.add_argument("key"); sp.set_defaults(func=cmd_script)
     sp = sub.add_parser("dot"); sp.add_argument("key"); sp.set_defaults(func=cmd_dot)
+    sp = sub.add_parser("json"); sp.add_argument("key", nargs="?")
+    sp.set_defaults(func=cmd_json)
     sub.add_parser("messages").set_defaults(func=cmd_messages)
     sp = sub.add_parser("attributes"); sp.add_argument("filter", nargs="?")
     sp.set_defaults(func=cmd_attributes)

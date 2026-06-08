@@ -100,6 +100,7 @@ export UNVIRT=/path/to/your/build/Unvirt
 cmo_script_dump.py scripts                 # list the behavior-graph "scripts"
 cmo_script_dump.py script <index|name>     # render one: nodes + params + exec links
 cmo_script_dump.py dot <index|name> | dot -Tsvg -o script.svg
+cmo_script_dump.py json [index|name]       # one script (or all) as JSON — diff/tooling
 cmo_script_dump.py search <text>           # any object by name
 cmo_script_dump.py messages                # Message Manager table (index -> name)
 cmo_script_dump.py attributes [filter]     # Attribute Manager table (index -> name)
@@ -110,6 +111,11 @@ cmo_script_dump.py chunk <index>           # raw CKStateChunk for one object
 The first `scripts`/`script` call runs `Unvirt` once and caches the decoded dump
 next to the script (`.cache_<file>_*.tsv`); later calls are instant. Use
 `--refresh-graph` to rebuild.
+
+Works on `.cmo`, `.nmo` and `.vmo` (Virtools 2.1+ / NeMo "Nemo Fi" containers);
+tested across several files of different types and content. Exotic custom
+parameter types that aren't recognised fall back to showing both int and float
+interpretations (`i=…/f=…`) or raw hex rather than guessing.
 
 ## License
 MIT (see `LICENSE`). The included patch modifies
