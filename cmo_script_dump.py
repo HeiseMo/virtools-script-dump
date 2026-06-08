@@ -27,6 +27,7 @@ Usage
   cmo_script_dump.py dot <index|name>          # emit Graphviz .dot for one script
   cmo_script_dump.py json [index|name]         # one script (or all) as JSON, for diff/tooling
   cmo_script_dump.py dataflow <param|#index>   # trace backward what produces a parameter's value
+  cmo_script_dump.py blocks [--dll strings.txt] # leaf building-block types + proto GUID (C++ blocks)
   cmo_script_dump.py messages                  # the Message Manager name table (index->name)
   cmo_script_dump.py attributes [filter]       # Attribute Manager strings (name reference)
 
@@ -528,6 +529,25 @@ class GraphModel:
         """Graph behaviors (have children) that are not nested in another graph."""
         return sorted(g for g in self.children if g not in self.parent)
 
+    def leaf_block_guid(self, idx):
+        """Prototype GUID of a leaf building block (None for graph behaviors).
+        A leaf's NEWDATA is [flags, guid_lo, guid_hi, ...]; graphs carry no GUID.
+        The GUID + name is the bridge to the block's C++ implementation (custom
+        blocks are declared in the game DLL, findable by the name string)."""
+        if idx in self.children:
+            return None
+        nd = self._newdata(idx)
+        return (nd[1], nd[2]) if len(nd) >= 3 else None
+
+    def leaf_blocks(self):
+        """Counter of distinct leaf building-block types keyed by (name, guid)."""
+        import collections
+        out = collections.Counter()
+        for idx, r in self.rows.items():
+            if r["cid"] == 8 and idx not in self.children:
+                out[(r["name"], self.leaf_block_guid(idx))] += 1
+        return out
+
     # -- parameter data-flow -------------------------------------------------
     def _dataflow_index(self):
         """Build reverse indices for tracing how a parameter value is produced:
@@ -716,6 +736,40 @@ def _script_dict(g, root, seen=None):
     return {"index": root, "name": g.name(root), "nodes": nodes, "links": links}
 
 
+def cmd_blocks(args):
+    """List distinct leaf building-block types with their prototype GUID + usage
+    count — the blocks whose implementation is C++ (Virtools' DLLs for standard
+    blocks, the game DLL for custom ones), not in the scene.
+
+    With --dll <strings-file> (e.g. `strings game.dll`, or
+    `rizin -qc izzj game.dll | jq -r .[].string`), blocks whose name appears in
+    that file are flagged [DLL] — i.e. implemented in the game binary."""
+    g = load_graph(args)
+    blocks = g.leaf_blocks()
+    needle = args.filter.lower() if args.filter else None
+    dll_names = None
+    if args.dll:
+        with open(args.dll, encoding="utf-8", errors="replace") as fh:
+            dll_names = {ln.rstrip("\n") for ln in fh}
+    shown = in_dll = 0
+    for (name, guid), cnt in sorted(blocks.items(),
+                                    key=lambda kv: (-kv[1], kv[0][0].lower())):
+        if needle and needle not in name.lower():
+            continue
+        gs = f"{guid[0]:08x},{guid[1]:08x}" if guid else "(no guid)"
+        tag = ""
+        if dll_names is not None:
+            hit = name in dll_names
+            tag = "  [DLL]" if hit else ""
+            in_dll += hit
+        print(f"{cnt:5d}x  {gs}  {name}{tag}")
+        shown += 1
+    msg = f"\n{shown} of {len(blocks)} distinct leaf building-block types"
+    if dll_names is not None:
+        msg += f"; {in_dll} confirmed in the supplied DLL strings (custom/game blocks)"
+    sys.stderr.write(msg + "\n")
+
+
 def cmd_dataflow(args):
     """Trace backward what produces a parameter's value (by name or #index)."""
     g = load_graph(args)
@@ -823,6 +877,10 @@ def main():
     sp = sub.add_parser("dataflow"); sp.add_argument("key")
     sp.add_argument("--limit", type=int, default=6)
     sp.set_defaults(func=cmd_dataflow)
+    sp = sub.add_parser("blocks"); sp.add_argument("filter", nargs="?")
+    sp.add_argument("--dll", help="strings file of the game DLL; flags blocks "
+                                  "implemented there with [DLL]")
+    sp.set_defaults(func=cmd_blocks)
     sub.add_parser("messages").set_defaults(func=cmd_messages)
     sp = sub.add_parser("attributes"); sp.add_argument("filter", nargs="?")
     sp.set_defaults(func=cmd_attributes)
